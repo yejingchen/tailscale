@@ -81,6 +81,25 @@ jobs:
       # tar and gzip are needed by the actions/checkout below.
       run: zypper --non-interactive install tar gzip ${{ matrix.deps }}
       if: contains(matrix.image, 'opensuse')
+      # Parrot recently (~2025-01-11) rotated their GPG keys for package signing
+      # but have not (as of 2025-01-24) updated their LTS image to include these
+      # new GPG keys. This image does not come with CURL / wget / a sane way of
+      # fetching the .deb file that their blog post around the key rotation points
+      # to (see https://parrotsec.org/blog/2025-01-11-parrot-gpg-keys/) so instead
+      # use a combination of openssl s_clients and sed to download the .deb and strip
+      # the header information from the resulting file so that it is a a valid .deb
+      # that we can install.
+    - name: install new GPG key (parrotsec/core:lts-amd64)
+      run: |
+        printf "GET /parrot/pool/main/p/parrot-archive-keyring/parrot-archive-keyring_2024.12_all.deb HTTP/1.1\r\nHost: www.deb.parrot.sh\r\nConnection: close\r\n\r\n" | openssl s_client -connect www.deb.parrot.sh:443 -quiet | sed  '/<arch>/,$!d' > parrot-archive-keyring_2024.12_all.deb 
+        SHA_VAL=$(sha256sum parrot-archive-keyring_2024.12_all.deb)
+        if "$SHA_VAL" != "188c74cf726fad499ec416dc6b7dcd9718800aa7178290c10ef7040aea9b5272"
+        then
+          echo "Unexpected SHA for deb"
+          exit 1
+        fi
+        dpkg -i parrot-archive-keyring_2024.12_all.deb
+      if: contains(matrix.image, 'parrotsec/core:lts-amd64')
     - name: install dependencies (apt-get)
       run: |
         apt-get update
@@ -92,10 +111,7 @@ jobs:
         || contains(matrix.image, 'parrotsec')
         || contains(matrix.image, 'kalilinux')
     - name: checkout
-      # We cannot use v4, as it requires a newer glibc version than some of the
-      # tested images provide. See
-      # https://github.com/actions/checkout/issues/1487
-      uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3.6.0
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: run installer
       run: scripts/installer.sh
       # Package installation can fail in docker because systemd is not running
