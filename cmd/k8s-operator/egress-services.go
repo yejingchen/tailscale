@@ -59,6 +59,8 @@ const (
 	maxPorts = 1000
 
 	indexEgressProxyGroup = ".metadata.annotations.egress-proxy-group"
+
+	tsHealthCheckPortName = "tailscale-health-check"
 )
 
 var gaugeEgressServices = clientmetric.NewGauge(kubetypes.MetricEgressServiceCount)
@@ -68,10 +70,11 @@ var gaugeEgressServices = clientmetric.NewGauge(kubetypes.MetricEgressServiceCou
 // on whose proxies it should be exposed.
 type egressSvcsReconciler struct {
 	client.Client
-	logger      *zap.SugaredLogger
-	recorder    record.EventRecorder
-	clock       tstime.Clock
-	tsNamespace string
+	logger            *zap.SugaredLogger
+	recorder          record.EventRecorder
+	clock             tstime.Clock
+	tsNamespace       string
+	defaultProxyClass string
 
 	mu   sync.Mutex           // protects following
 	svcs set.Slice[types.UID] // UIDs of all currently managed egress Services for ProxyGroup
@@ -229,15 +232,16 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 		found := false
 		for _, wantsPM := range svc.Spec.Ports {
 			if wantsPM.Port == pm.Port && strings.EqualFold(string(wantsPM.Protocol), string(pm.Protocol)) {
-				// We don't use the port name to distinguish this port internally, but Kubernetes
-				// require that, for Service ports with more than one name each port is uniquely named.
-				// So we can always pick the port name from the ExternalName Service as at this point we
-				// know that those are valid names because Kuberentes already validated it once. Note
-				// that users could have changed an unnamed port to a named port and might have changed
-				// port names- this should still work.
+				// We want to both preserve the user set port names for ease of debugging, but also
+				// ensure that we name all unnamed ports as the ClusterIP Service that we create will
+				// always have at least two ports.
 				// https://kubernetes.io/docs/concepts/services-networking/service/#multi-port-services
 				// See also https://github.com/tailscale/tailscale/issues/13406#issuecomment-2507230388
-				clusterIPSvc.Spec.Ports[i].Name = wantsPM.Name
+				if wantsPM.Name != "" {
+					clusterIPSvc.Spec.Ports[i].Name = wantsPM.Name
+				} else {
+					clusterIPSvc.Spec.Ports[i].Name = "tailscale-unnamed"
+				}
 				found = true
 				break
 			}
@@ -252,6 +256,12 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 	// ClusterIP Service produce new target port and add a portmapping to
 	// the ClusterIP Service.
 	for _, wantsPM := range svc.Spec.Ports {
+		// Because we add a healthcheck port of our own, we will always have at least two ports. That
+		// means that we cannot have ports with name not set.
+		// https://kubernetes.io/docs/concepts/services-networking/service/#multi-port-services
+		if wantsPM.Name == "" {
+			wantsPM.Name = "tailscale-unnamed"
+		}
 		found := false
 		for _, gotPM := range clusterIPSvc.Spec.Ports {
 			if wantsPM.Port == gotPM.Port && strings.EqualFold(string(wantsPM.Protocol), string(gotPM.Protocol)) {
@@ -278,6 +288,25 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 			})
 		}
 	}
+	var healthCheckPort int32 = 9002
+
+	for {
+		if !slices.ContainsFunc(svc.Spec.Ports, func(p corev1.ServicePort) bool {
+			return p.Port == healthCheckPort
+		}) {
+			break
+		}
+		healthCheckPort++
+		if healthCheckPort > 10002 {
+			return nil, false, fmt.Errorf("unable to find a free port for internal health check in range [9002, 10002)")
+		}
+	}
+	clusterIPSvc.Spec.Ports = append(clusterIPSvc.Spec.Ports, corev1.ServicePort{
+		Name:       tsHealthCheckPortName,
+		Port:       healthCheckPort,
+		TargetPort: intstr.FromInt(9002),
+		Protocol:   "TCP",
+	})
 	if !reflect.DeepEqual(clusterIPSvc, oldClusterIPSvc) {
 		if clusterIPSvc, err = createOrUpdate(ctx, esr.Client, esr.tsNamespace, clusterIPSvc, func(svc *corev1.Service) {
 			svc.Labels = clusterIPSvc.Labels
@@ -309,7 +338,10 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 	}); err != nil {
 		return nil, false, fmt.Errorf("error ensuring EndpointSlice: %w", err)
 	}
-
+	hasLocalAddrPort, err := userHasConfiguredLocalAddrPort(ctx, esr.Client, proxyGroupName, esr.defaultProxyClass)
+	if err != nil {
+		return nil, false, fmt.Errorf("error checking if user has configured TS_LOCAL_ADDR_PORT: %w", err)
+	}
 	cm, cfgs, err := egressSvcsConfigs(ctx, esr.Client, proxyGroupName, esr.tsNamespace)
 	if err != nil {
 		return nil, false, fmt.Errorf("error retrieving egress services configuration: %w", err)
@@ -318,9 +350,12 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 		l.Info("ConfigMap not yet created, waiting..")
 		return nil, false, nil
 	}
+	if hasLocalAddrPort {
+		l.Info("User has configured TS_LOCAL_ADDR_PORT, skipping healthcheck")
+	}
 	tailnetSvc := tailnetSvcName(svc)
 	gotCfg := (*cfgs)[tailnetSvc]
-	wantsCfg := egressSvcCfg(svc, clusterIPSvc)
+	wantsCfg := egressSvcCfg(svc, clusterIPSvc, esr.tsNamespace, l, hasLocalAddrPort)
 	if !reflect.DeepEqual(gotCfg, wantsCfg) {
 		l.Debugf("updating egress services ConfigMap %s", cm.Name)
 		mak.Set(cfgs, tailnetSvc, wantsCfg)
@@ -422,6 +457,7 @@ func (esr *egressSvcsReconciler) usedPortsForPG(ctx context.Context, pg string) 
 // has no selector. Traffic sent to it will be routed to the endpoints defined
 // by an EndpointSlice created for this egress service.
 func (esr *egressSvcsReconciler) clusterIPSvcForEgress(crl map[string]string) *corev1.Service {
+
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: svcNameBase(crl[LabelParentName]),
@@ -495,6 +531,7 @@ func (esr *egressSvcsReconciler) validateClusterResources(ctx context.Context, s
 		tsoperator.RemoveServiceCondition(svc, tsapi.EgressSvcConfigured)
 		return false, err
 	}
+
 	if violations := validateEgressService(svc, pg); len(violations) > 0 {
 		msg := fmt.Sprintf("invalid egress Service: %s", strings.Join(violations, ", "))
 		esr.recorder.Event(svc, corev1.EventTypeWarning, "INVALIDSERVICE", msg)
@@ -504,15 +541,31 @@ func (esr *egressSvcsReconciler) validateClusterResources(ctx context.Context, s
 		return false, nil
 	}
 	if !tsoperator.ProxyGroupIsReady(pg) {
-		l.Infof("ProxyGroup %s is not ready, waiting...", proxyGroupName)
 		tsoperator.SetServiceCondition(svc, tsapi.EgressSvcValid, metav1.ConditionUnknown, reasonProxyGroupNotReady, reasonProxyGroupNotReady, esr.clock, l)
 		tsoperator.RemoveServiceCondition(svc, tsapi.EgressSvcConfigured)
-		return false, nil
 	}
 
 	l.Debugf("egress service is valid")
 	tsoperator.SetServiceCondition(svc, tsapi.EgressSvcValid, metav1.ConditionTrue, reasonEgressSvcValid, reasonEgressSvcValid, esr.clock, l)
 	return true, nil
+}
+
+func egressSvcCfg(externalNameSvc, clusterIPSvc *corev1.Service, ns string, l *zap.SugaredLogger, skipHealthCheck bool) egressservices.Config {
+	d := retrieveClusterDomain(ns, l)
+	tt := tailnetTargetFromSvc(externalNameSvc)
+	hep := healthCheckForSvc(clusterIPSvc, d)
+	cfg := egressservices.Config{TailnetTarget: tt}
+	if !skipHealthCheck {
+		cfg.HealthCheckEndpoint = hep
+	}
+	for _, svcPort := range clusterIPSvc.Spec.Ports {
+		if svcPort.Name == tsHealthCheckPortName {
+			continue // exclude healthcheck from egress svcs configs
+		}
+		pm := portMap(svcPort)
+		mak.Set(&cfg.Ports, pm, struct{}{})
+	}
+	return cfg
 }
 
 func validateEgressService(svc *corev1.Service, pg *tsapi.ProxyGroup) []string {
@@ -582,16 +635,6 @@ func tailnetTargetFromSvc(svc *corev1.Service) egressservices.TailnetTarget {
 	return egressservices.TailnetTarget{
 		IP: svc.Annotations[AnnotationTailnetTargetIP],
 	}
-}
-
-func egressSvcCfg(externalNameSvc, clusterIPSvc *corev1.Service) egressservices.Config {
-	tt := tailnetTargetFromSvc(externalNameSvc)
-	cfg := egressservices.Config{TailnetTarget: tt}
-	for _, svcPort := range clusterIPSvc.Spec.Ports {
-		pm := portMap(svcPort)
-		mak.Set(&cfg.Ports, pm, struct{}{})
-	}
-	return cfg
 }
 
 func portMap(p corev1.ServicePort) egressservices.PortMap {
@@ -739,4 +782,49 @@ func (esr *egressSvcsReconciler) updateSvcSpec(ctx context.Context, svc *corev1.
 	err := esr.Update(ctx, svc)
 	svc.Status = *st
 	return err
+}
+
+// userHasConfiguredLocalAddrPort returns true if users have explicitly set TS_LOCAL_ADDR_PORT in the ProxyClass for the egress ProxyGroup.
+// If so, we do not support healthchecking for graceful shutdown.
+func userHasConfiguredLocalAddrPort(ctx context.Context, cl client.Client, proxyGroupName string, defaultProxyClass string) (bool, error) {
+	pg := &tsapi.ProxyGroup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: proxyGroupName,
+		},
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(pg), pg); err != nil {
+		return false, fmt.Errorf("unable to retrieve ProxyGroup %s: %w", proxyGroupName, err)
+	}
+
+	// Determine which ProxyClass to check
+	proxyClassName := pg.Spec.ProxyClass
+	if proxyClassName == "" {
+		// If no ProxyClass specified, use the default if one is configured
+		if defaultProxyClass == "" {
+			return false, nil
+		}
+		proxyClassName = defaultProxyClass
+	}
+
+	proxyClass := &tsapi.ProxyClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: proxyClassName,
+		},
+	}
+	err := cl.Get(ctx, client.ObjectKeyFromObject(proxyClass), proxyClass)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("unable to retrieve ProxyClass %s: %w", proxyClassName, err)
+	}
+
+	if proxyClass.Spec.StatefulSet != nil && proxyClass.Spec.StatefulSet.Pod != nil && proxyClass.Spec.StatefulSet.Pod.TailscaleContainer != nil {
+		for _, env := range proxyClass.Spec.StatefulSet.Pod.TailscaleContainer.Env {
+			if env.Name == "TS_LOCAL_ADDR_PORT" {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }

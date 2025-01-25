@@ -12,12 +12,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/yaml"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/egressservices"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/ptr"
 )
+
+// deletionGracePeriodSeconds is set to 6 minutes to ensure that the pre-stop hook of these proxies have enough chance to terminate gracefully.
+var deletionGracePeriodSeconds int64 = 360
 
 // Returns the base StatefulSet definition for a ProxyGroup. A ProxyClass may be
 // applied over the top after.
@@ -45,6 +49,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 	ss.Spec.Selector = &metav1.LabelSelector{
 		MatchLabels: pgLabels(pg.Name, nil),
 	}
+	ss.DeletionGracePeriodSeconds = &deletionGracePeriodSeconds
 
 	// Template config.
 	tmpl := &ss.Spec.Template
@@ -86,6 +91,7 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 
 		return volumes
 	}()
+	tmpl.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: "tailscale.com/egress-services"}}
 
 	// Main container config.
 	c := &ss.Spec.Template.Spec.Containers[0]
@@ -153,7 +159,14 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 					Name:  "TS_INTERNAL_APP",
 					Value: kubetypes.AppProxyGroupEgress,
 				},
-			)
+				corev1.EnvVar{
+					Name:  "TS_EGRESS_PROXY_GROUP_REPLICA_COUNT_PATH",
+					Value: fmt.Sprintf("/etc/proxies/%s", egressservices.KeyProxyGroupReplicaCount),
+				},
+				corev1.EnvVar{
+					Name:  "TS_ENABLE_HEALTH_CHECK",
+					Value: "true",
+				})
 		} else { // ingress
 			envs = append(envs, corev1.EnvVar{
 				Name:  "TS_INTERNAL_APP",
@@ -166,7 +179,14 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 		}
 		return append(c.Env, envs...)
 	}()
-
+	c.Lifecycle = &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: kubetypes.EgessServicesPreshutdownEP,
+				Port: intstr.FromInt(9002),
+			},
+		},
+	}
 	return ss, nil
 }
 
@@ -266,8 +286,10 @@ func pgEgressCM(pg *tsapi.ProxyGroup, namespace string) *corev1.ConfigMap {
 			Labels:          pgLabels(pg.Name, nil),
 			OwnerReferences: pgOwnerReference(pg),
 		},
+		Data: map[string]string{egressservices.KeyProxyGroupReplicaCount: fmt.Sprintf("%d", pgReplicas(pg))},
 	}
 }
+
 func pgIngressCM(pg *tsapi.ProxyGroup, namespace string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{

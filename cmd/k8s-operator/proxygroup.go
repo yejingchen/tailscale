@@ -166,6 +166,7 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 			r.recorder.Eventf(pg, corev1.EventTypeWarning, reasonProxyGroupCreationFailed, err.Error())
 			return setStatusReady(pg, metav1.ConditionFalse, reasonProxyGroupCreationFailed, err.Error())
 		}
+		validateProxyClassForPG(logger, pg, proxyClass)
 		if !tsoperator.ProxyClassIsReady(proxyClass) {
 			message := fmt.Sprintf("the ProxyGroup's ProxyClass %s is not yet in a ready state, waiting...", proxyClassName)
 			logger.Info(message)
@@ -204,6 +205,24 @@ func (r *ProxyGroupReconciler) Reconcile(ctx context.Context, req reconcile.Requ
 	return setStatusReady(pg, metav1.ConditionTrue, reasonProxyGroupReady, reasonProxyGroupReady)
 }
 
+func validateProxyClassForPG(logger *zap.SugaredLogger, pg *tsapi.ProxyGroup, pc *tsapi.ProxyClass) {
+	if pg.Spec.Type == tsapi.ProxyGroupTypeIngress {
+		return
+	}
+	if pc == nil || pc.Spec.StatefulSet == nil || pc.Spec.StatefulSet.Pod == nil || pc.Spec.StatefulSet.Pod.TailscaleContainer == nil {
+		return
+	}
+	for _, envv := range pc.Spec.StatefulSet.Pod.TailscaleContainer.Env {
+		if envv.Name == "TS_LOCAL_ADDR_PORT" {
+			logger.Warnf(`ProxyClass %s applied to an egress ProxyGroup has TS_LOCAL_ADDR_PORT env var set to a custom value.
+			This will cause the ProxyGroup failover mechanism to not function well.
+			In future we will remove the ability to set custom TS_LOCAL_ADDR_PORT for egress ProxyGroups.
+			Please raise an issue if you expect that this will cause issues for your workflow.
+			`)
+		}
+	}
+}
+
 func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.ProxyGroup, proxyClass *tsapi.ProxyClass) error {
 	logger := r.logger(pg.Name)
 	r.mu.Lock()
@@ -214,6 +233,7 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, pg *tsapi.Pro
 	if err != nil {
 		return fmt.Errorf("error provisioning config Secrets: %w", err)
 	}
+
 	// State secrets are precreated so we can use the ProxyGroup CR as their owner ref.
 	stateSecrets := pgStateSecrets(pg, r.tsNamespace)
 	for _, sec := range stateSecrets {
